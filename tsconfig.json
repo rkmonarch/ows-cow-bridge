@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    // ── Output ────────────────────────────────────────────────────────────────
+    "outDir": "./dist",
+    "rootDir": "./src",
+
+    // ── Module system ─────────────────────────────────────────────────────────
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+
+    // ── Language features ─────────────────────────────────────────────────────
+    "lib": ["ES2022", "DOM"],
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "useDefineForClassFields": true,
+
+    // ── JSX (Ink uses React JSX) ───────────────────────────────────────────────
+    "jsx": "react-jsx",
+    "jsxImportSource": "react",
+
+    // ── Strictness ────────────────────────────────────────────────────────────
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+
+    // ── Interop ───────────────────────────────────────────────────────────────
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // ── Skip type-checking inside node_modules (many deps ship broken d.ts) ─
+    "skipLibCheck": true,
+
+    // ── Source maps ───────────────────────────────────────────────────────────
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // ── Paths ─────────────────────────────────────────────────────────────────
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
