@@ -1,509 +1,332 @@
 /**
  * main.tsx
  * ─────────────────────────────────────────────────────────────────────────────
- * Ink (React-in-terminal) entry point for TerminalSwap.
+ * Terminal UI for TerminalSwap.
  *
- * Layout (auto-sized to terminal width):
- * ┌────────────────────────────────────────────────────────────────────────┐
- * │  TerminalSwap  v1.0  │  wallet: my-wallet  │  acct: 0x1234…abcd      │
- * ├────────────────┬───────────────────────────────────────────────────────┤
- * │  Chat          │  Balances / Pending Txs / Logs (tabbed side panel)   │
- * │  [messages]    │                                                       │
- * │                │                                                       │
- * ├────────────────┴───────────────────────────────────────────────────────┤
- * │  > Type your command…  [ENTER to send]  [TAB to switch panel]         │
- * └────────────────────────────────────────────────────────────────────────┘
+ * Uses Node.js readline for input (no raw-mode / TTY requirement — works in
+ * VS Code integrated terminal, bun, piped environments, etc.) and chalk +
+ * ANSI escape codes for coloured output.
  *
- * Keyboard shortcuts:
- *  Enter        → Send message / confirm YES
- *  Ctrl+C       → Exit
- *  Tab          → Cycle side panel tabs
- *  Ctrl+L       → Clear chat
+ * The Ink approach was dropped because bun's process.stdin does not expose
+ * setRawMode, which prevented any keystrokes from being captured.
  */
 
 import "dotenv/config";
-import React, { useState, useEffect, useCallback, useRef } from "react";
-import { render, Box, Text, useInput, useApp, Static } from "ink";
-import TextInput from "ink-text-input";
-import Spinner from "ink-spinner";
+import readline from "node:readline";
+import chalk from "chalk";
 import type { BaseMessage } from "@langchain/core/messages";
 import { buildAgentGraph, runAgentTurn, type AgentGraph } from "./agent.js";
-import { bus, type LogEntry, type PendingTx, type LogLevel } from "./utils.js";
+import {
+  bus,
+  type LogEntry,
+  type LogLevel,
+} from "./utils.js";
 import { hasActiveWallet, getActiveWallet } from "./wallet/index.js";
 import { ENV } from "./config.js";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── ANSI helpers ──────────────────────────────────────────────────────────────
 
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  ts: Date;
-}
+const RESET  = "\x1b[0m";
+const BOLD   = "\x1b[1m";
+const DIM    = "\x1b[2m";
+const CYAN   = "\x1b[36m";
+const GREEN  = "\x1b[32m";
+const YELLOW = "\x1b[33m";
+const RED    = "\x1b[31m";
+const GRAY   = "\x1b[90m";
+const BGREEN = "\x1b[92m";
+const BWHITE = "\x1b[97m";
+const MAG    = "\x1b[35m";
 
-interface ConfirmRequest {
-  txId: string;
-  prompt: string;
-}
-
-type SidePanel = "logs" | "txs";
-
-// ── Color helpers ─────────────────────────────────────────────────────────────
+function c(color: string, text: string) { return `${color}${text}${RESET}`; }
 
 const LEVEL_COLOR: Record<LogLevel, string> = {
-  info:    "cyan",
-  success: "green",
-  warn:    "yellow",
-  error:   "red",
-  debug:   "gray",
+  info:    CYAN,
+  success: GREEN,
+  warn:    YELLOW,
+  error:   RED,
+  debug:   GRAY,
 };
 
-// ── Sub-components ────────────────────────────────────────────────────────────
+// ── Print helpers ─────────────────────────────────────────────────────────────
 
-/** Single chat bubble */
-const ChatBubble: React.FC<{ msg: ChatMessage }> = ({ msg }) => {
-  const isUser = msg.role === "user";
-  const isSystem = msg.role === "system";
-  const timeStr = msg.ts.toTimeString().slice(0, 8);
-
-  return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Box>
-        <Text
-          color={isSystem ? "yellow" : isUser ? "greenBright" : "cyanBright"}
-          bold
-        >
-          {isSystem ? "⚙ system" : isUser ? "▶ you" : "◆ agent"}
-        </Text>
-        <Text color="gray" dimColor>
-          {" "}
-          {timeStr}
-        </Text>
-      </Box>
-      <Box paddingLeft={2}>
-        <Text
-          color={isSystem ? "yellow" : isUser ? "white" : "white"}
-          wrap="wrap"
-        >
-          {msg.content}
-        </Text>
-      </Box>
-    </Box>
-  );
-};
-
-/** Log line */
-const LogLine: React.FC<{ entry: LogEntry }> = ({ entry }) => {
-  const timeStr = entry.ts.toTimeString().slice(0, 8);
-  return (
-    <Box>
-      <Text color="gray">{timeStr} </Text>
-      <Text
-        color={LEVEL_COLOR[entry.level] as Parameters<typeof Text>[0]["color"]}
-      >
-        {entry.message}
-      </Text>
-    </Box>
-  );
-};
-
-/** Pending transaction row */
-const TxRow: React.FC<{ tx: PendingTx }> = ({ tx }) => {
-  const statusColor =
-    tx.status === "confirmed" ? "green" :
-    tx.status === "failed"    ? "red"   : "yellow";
-  const statusIcon =
-    tx.status === "confirmed" ? "✓" :
-    tx.status === "failed"    ? "✗" : "…";
-
-  return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Box>
-        <Text color={statusColor} bold>{statusIcon} </Text>
-        <Text wrap="wrap">{tx.label}</Text>
-      </Box>
-      {tx.hash && (
-        <Box paddingLeft={2}>
-          <Text color="gray" dimColor>
-            {tx.hash.slice(0, 10)}…{tx.hash.slice(-8)}
-          </Text>
-        </Box>
-      )}
-    </Box>
-  );
-};
-
-// ── Main App ──────────────────────────────────────────────────────────────────
-
-const App: React.FC = () => {
-  const { exit } = useApp();
-
-  // Chat history shown in the main pane
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      id: "welcome",
-      role: "system",
-      content:
-        "Welcome to TerminalSwap! Type a command like:\n" +
-        "  • swap 0.5 ETH to USDC on Base\n" +
-        "  • bridge 100 USDC from Arbitrum to Ethereum\n" +
-        "  • buy $200 of ETH with card\n" +
-        "  • show my balances on Base and Arbitrum\n" +
-        "  • create-wallet myWallet    (first-time setup)\n" +
-        "  • load-wallet myWallet      (unlock existing)\n\n" +
-        `LLM: ${ENV.LLM_MODEL} | Keys: ${ENV.OPENAI_API_KEY ? "✓" : "✗ (set OPENAI_API_KEY)"}`,
-      ts: new Date(),
-    },
-  ]);
-
-  // LangGraph conversation state (for multi-turn memory)
-  const conversationHistory = useRef<BaseMessage[]>([]);
-
-  // LangGraph agent (lazy-init on first use)
-  const agentGraph = useRef<AgentGraph | null>(null);
-
-  // Input state
-  const [inputValue, setInputValue] = useState("");
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [activePanel, setActivePanel] = useState<SidePanel>("logs");
-
-  // Confirmation state
-  const [pendingConfirm, setPendingConfirm] = useState<ConfirmRequest | null>(null);
-  const [confirmInput, setConfirmInput] = useState("");
-
-  // Side panel data
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [pendingTxs, setPendingTxs] = useState<PendingTx[]>([]);
-
-  // Wallet display
-  const [walletName, setWalletName] = useState<string>("-");
-  const [walletAddr, setWalletAddr] = useState<string>("-");
-
-  // ── Event bus subscriptions ─────────────────────────────────────────────────
-
-  useEffect(() => {
-    const handleLog = (entry: LogEntry) => {
-      setLogs((prev) => [...prev.slice(-199), entry]); // keep last 200
-    };
-
-    const handleTxUpdate = (tx: PendingTx) => {
-      setPendingTxs((prev) => {
-        const idx = prev.findIndex((t) => t.id === tx.id);
-        if (idx >= 0) {
-          const next = [...prev];
-          next[idx] = tx;
-          return next;
-        }
-        return [...prev, tx];
-      });
-    };
-
-    const handleConfirmRequest = (data: { prompt: string; txId: string }) => {
-      setPendingConfirm(data);
-      setConfirmInput("");
-    };
-
-    bus.on("log", handleLog);
-    bus.on("tx:update", handleTxUpdate);
-    bus.on("confirm:request", handleConfirmRequest);
-
-    return () => {
-      bus.off("log", handleLog);
-      bus.off("tx:update", handleTxUpdate);
-      bus.off("confirm:request", handleConfirmRequest);
-    };
-  }, []);
-
-  // Refresh wallet display when wallet changes
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (hasActiveWallet()) {
-        const w = getActiveWallet();
-        setWalletName(w.name);
-        setWalletAddr(w.accounts[0]?.address ?? "-");
-      }
-    }, 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  // ── Keyboard shortcuts ──────────────────────────────────────────────────────
-
-  useInput((input, key) => {
-    if (key.ctrl && input === "c") {
-      exit();
-      process.exit(0);
-    }
-    if (key.tab && !isProcessing && !pendingConfirm) {
-      setActivePanel((p) => (p === "logs" ? "txs" : "logs"));
-    }
-    if (key.ctrl && input === "l") {
-      setChatMessages([]);
-    }
-  });
-
-  // ── Helpers ─────────────────────────────────────────────────────────────────
-
-  function pushChat(role: ChatMessage["role"], content: string) {
-    setChatMessages((prev) => [
-      ...prev,
-      { id: `${Date.now()}-${Math.random()}`, role, content, ts: new Date() },
-    ]);
-  }
-
-  function getOrCreateGraph(): AgentGraph {
-    if (!agentGraph.current) {
-      agentGraph.current = buildAgentGraph();
-    }
-    return agentGraph.current;
-  }
-
-  // ── Handle confirmation input ────────────────────────────────────────────────
-
-  const handleConfirmSubmit = useCallback(
-    (value: string) => {
-      if (!pendingConfirm) return;
-      const approved = value.trim().toUpperCase() === "YES";
-      bus.confirmationResponse(pendingConfirm.txId, approved);
-      setPendingConfirm(null);
-      setConfirmInput("");
-      pushChat("system", approved ? "✅ Confirmed — signing…" : "❌ Cancelled.");
-    },
-    [pendingConfirm],
-  );
-
-  // ── Handle normal chat input ─────────────────────────────────────────────────
-
-  const handleSubmit = useCallback(
-    async (value: string) => {
-      const trimmed = value.trim();
-      if (!trimmed) return;
-      setInputValue("");
-
-      // Intercept local commands that don't need the LLM
-      if (trimmed === "clear" || trimmed === "/clear") {
-        setChatMessages([]);
-        return;
-      }
-      if (trimmed === "exit" || trimmed === "/exit") {
-        exit();
-        process.exit(0);
-      }
-
-      pushChat("user", trimmed);
-      setIsProcessing(true);
-      bus.log("info", `User: ${trimmed.slice(0, 60)}${trimmed.length > 60 ? "…" : ""}`);
-
-      try {
-        const graph = getOrCreateGraph();
-        const { response, updatedHistory } = await runAgentTurn(
-          graph,
-          conversationHistory.current,
-          trimmed,
-        );
-        conversationHistory.current = updatedHistory;
-
-        if (response) {
-          pushChat("assistant", response);
-        }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        bus.log("error", `Agent error: ${msg}`);
-        pushChat("assistant", `⚠️  Error: ${msg}`);
-      } finally {
-        setIsProcessing(false);
-      }
-    },
-    [],
-  );
-
-  // ── Render ───────────────────────────────────────────────────────────────────
-
-  const termWidth = process.stdout.columns ?? 120;
-  const chatWidth = Math.floor(termWidth * 0.62);
-  const panelWidth = termWidth - chatWidth - 3;
-
-  return (
-    <Box flexDirection="column" width={termWidth}>
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <Box
-        borderStyle="round"
-        borderColor="greenBright"
-        paddingX={1}
-        width={termWidth}
-      >
-        <Text color="greenBright" bold>
-          TerminalSwap
-        </Text>
-        <Text color="gray"> v1.0  │  </Text>
-        <Text color="cyan">wallet: </Text>
-        <Text color="white">{walletName}</Text>
-        <Text color="gray">  │  </Text>
-        <Text color="cyan">acct: </Text>
-        <Text color="magenta">
-          {walletAddr !== "-"
-            ? `${walletAddr.slice(0, 6)}…${walletAddr.slice(-4)}`
-            : "no wallet loaded"}
-        </Text>
-        <Text color="gray">  │  </Text>
-        <Text color="yellow">model: {ENV.LLM_MODEL}</Text>
-      </Box>
-
-      {/* ── Main area ──────────────────────────────────────────────────────── */}
-      <Box flexDirection="row" width={termWidth}>
-        {/* Chat pane */}
-        <Box
-          flexDirection="column"
-          width={chatWidth}
-          borderStyle="single"
-          borderColor="gray"
-          paddingX={1}
-          height={24}
-          overflow="hidden"
-        >
-          <Text color="gray" bold>
-            Chat  [Ctrl+L clear]
-          </Text>
-          <Box flexDirection="column" overflow="hidden">
-            {chatMessages.slice(-14).map((msg) => (
-              <ChatBubble key={msg.id} msg={msg} />
-            ))}
-          </Box>
-        </Box>
-
-        {/* Side panel */}
-        <Box
-          flexDirection="column"
-          width={panelWidth}
-          borderStyle="single"
-          borderColor="gray"
-          paddingX={1}
-          height={24}
-          overflow="hidden"
-        >
-          {/* Tab bar */}
-          <Box>
-            <Text
-              bold
-              color={activePanel === "logs" ? "greenBright" : "gray"}
-              underline={activePanel === "logs"}
-            >
-              Logs
-            </Text>
-            <Text color="gray">  </Text>
-            <Text
-              bold
-              color={activePanel === "txs" ? "greenBright" : "gray"}
-              underline={activePanel === "txs"}
-            >
-              Txs ({pendingTxs.length})
-            </Text>
-            <Text color="gray">  [TAB switch]</Text>
-          </Box>
-
-          {/* Panel content */}
-          {activePanel === "logs" ? (
-            <Box flexDirection="column" overflow="hidden">
-              {logs.slice(-16).map((entry, i) => (
-                <LogLine key={i} entry={entry} />
-              ))}
-            </Box>
-          ) : (
-            <Box flexDirection="column" overflow="hidden">
-              {pendingTxs.length === 0 ? (
-                <Text color="gray" dimColor>
-                  No transactions yet.
-                </Text>
-              ) : (
-                pendingTxs.slice(-8).map((tx) => (
-                  <TxRow key={tx.id} tx={tx} />
-                ))
-              )}
-            </Box>
-          )}
-        </Box>
-      </Box>
-
-      {/* ── Confirmation overlay ────────────────────────────────────────────── */}
-      {pendingConfirm && (
-        <Box
-          flexDirection="column"
-          borderStyle="double"
-          borderColor="yellow"
-          paddingX={2}
-          paddingY={1}
-          width={termWidth}
-        >
-          <Text color="yellow" bold>
-            ⚠  CONFIRMATION REQUIRED
-          </Text>
-          <Text color="white" wrap="wrap">
-            {pendingConfirm.prompt.split("\n").slice(0, 10).join("\n")}
-          </Text>
-          <Box marginTop={1}>
-            <Text color="yellow" bold>
-              Type YES to approve, or anything else to cancel:{" "}
-            </Text>
-            <TextInput
-              value={confirmInput}
-              onChange={setConfirmInput}
-              onSubmit={handleConfirmSubmit}
-              placeholder="YES / no"
-            />
-          </Box>
-        </Box>
-      )}
-
-      {/* ── Input bar ──────────────────────────────────────────────────────── */}
-      {!pendingConfirm && (
-        <Box
-          borderStyle="single"
-          borderColor={isProcessing ? "yellow" : "greenBright"}
-          paddingX={1}
-          width={termWidth}
-        >
-          {isProcessing ? (
-            <Box>
-              <Text color="yellow">
-                <Spinner type="dots" />
-              </Text>
-              <Text color="yellow"> Agent thinking…</Text>
-            </Box>
-          ) : (
-            <Box>
-              <Text color="greenBright" bold>
-                ▶{" "}
-              </Text>
-              <TextInput
-                value={inputValue}
-                onChange={setInputValue}
-                onSubmit={handleSubmit}
-                placeholder="swap 0.5 ETH to USDC on Base  |  Ctrl+C exit  |  TAB panel"
-              />
-            </Box>
-          )}
-        </Box>
-      )}
-
-      {/* ── Help hint ──────────────────────────────────────────────────────── */}
-      <Box>
-        <Text color="gray" dimColor>
-          Examples: "show balances on base"  •  "bridge 100 USDC arb→eth"  •  "buy $50 ETH with card"  •  "swap 1 WETH to DAI on mainnet"
-        </Text>
-      </Box>
-    </Box>
-  );
-};
-
-// ── Entry point ───────────────────────────────────────────────────────────────
-
-// Validate essential environment
-if (!ENV.OPENAI_API_KEY && !ENV.ANTHROPIC_API_KEY) {
-  console.error(
-    "\n⚠  No LLM API key found!\n" +
-    "   Set OPENAI_API_KEY (or ANTHROPIC_API_KEY) in your .env file.\n" +
-    "   See .env.example for reference.\n",
-  );
-  process.exit(1);
+function ts(): string {
+  return new Date().toTimeString().slice(0, 8);
 }
 
-render(<App />);
+function printHeader() {
+  const walletInfo = hasActiveWallet()
+    ? `${c(CYAN, "wallet:")} ${c(BWHITE, getActiveWallet().name)}  ${c(GRAY, "│")}  ${c(CYAN, "acct:")} ${c(MAG, (getActiveWallet().accounts[0]?.address?.slice(0, 6) ?? "") + "…" + (getActiveWallet().accounts[0]?.address?.slice(-4) ?? "none"))}`
+    : c(GRAY, "no wallet loaded");
+
+  const w = process.stdout.columns ?? 90;
+  const line = "─".repeat(w);
+
+  process.stdout.write(
+    `\n${c(BOLD + BGREEN, "┌" + line + "┐")}\n` +
+    `${c(BGREEN, "│")}  ${c(BOLD + BGREEN, "TerminalSwap")} ${c(GRAY, "v1.0")}  ${c(GRAY, "│")}  ${walletInfo}  ${c(GRAY, "│")}  ${c(YELLOW, "model: " + ENV.LLM_MODEL)}${c(BGREEN, "│")}\n` +
+    `${c(BOLD + BGREEN, "└" + line + "┘")}\n\n`,
+  );
+}
+
+function printWelcome() {
+  printHeader();
+  const lines = [
+    c(YELLOW, "⚙ system") + c(GRAY, ` ${ts()}`),
+    "  Welcome to TerminalSwap! Type a command, e.g.:",
+    c(GRAY, "    • swap 0.5 ETH to USDC on Base"),
+    c(GRAY, "    • bridge 100 USDC from Arbitrum to Ethereum"),
+    c(GRAY, "    • buy $200 of ETH with card"),
+    c(GRAY, "    • show my balances on Base and Arbitrum"),
+    c(GRAY, "    • create-wallet myWallet    (first-time setup)"),
+    c(GRAY, "    • load-wallet myWallet      (unlock existing)"),
+    "",
+    `  ${c(CYAN, "LLM:")} ${ENV.LLM_MODEL}  ${c(CYAN, "Keys:")} ${ENV.OPENAI_API_KEY ? c(GREEN, "✓") : c(RED, "✗ set OPENAI_API_KEY")}`,
+    "",
+    c(GRAY, "  Type 'exit' to quit."),
+    "",
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
+function printLog(entry: LogEntry) {
+  const color = LEVEL_COLOR[entry.level];
+  const prefix = entry.level === "debug" ? c(GRAY, "  [dbg]") : c(color, `  [${entry.level}]`);
+  process.stdout.write(`${c(GRAY, ts())} ${prefix} ${c(color, entry.message)}\n`);
+}
+
+function printUserMessage(text: string) {
+  process.stdout.write(`\n${c(BGREEN, "▶ you")} ${c(GRAY, ts())}\n  ${c(BWHITE, text)}\n\n`);
+}
+
+function printAssistantMessage(text: string) {
+  process.stdout.write(`${c(CYAN, "◆ agent")} ${c(GRAY, ts())}\n`);
+  // Word-wrap at terminal width, indented 2 spaces
+  const width = (process.stdout.columns ?? 90) - 4;
+  const words = text.split(" ");
+  let line = "  ";
+  for (const word of words) {
+    // Handle newlines in the agent response
+    if (word.includes("\n")) {
+      const parts = word.split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        if (i === 0) {
+          line += parts[i] + " ";
+        } else {
+          process.stdout.write(line.trimEnd() + "\n");
+          line = "  " + (parts[i] ? parts[i] + " " : "");
+        }
+      }
+    } else if ((line + word).length > width) {
+      process.stdout.write(line.trimEnd() + "\n");
+      line = "  " + word + " ";
+    } else {
+      line += word + " ";
+    }
+  }
+  if (line.trim()) process.stdout.write(line.trimEnd() + "\n");
+  process.stdout.write("\n");
+}
+
+function printSystemMessage(text: string) {
+  process.stdout.write(`${c(YELLOW, "⚙ system")} ${c(GRAY, ts())}\n  ${c(YELLOW, text)}\n\n`);
+}
+
+function printSeparator() {
+  const w = process.stdout.columns ?? 90;
+  process.stdout.write(c(GRAY, "─".repeat(w)) + "\n");
+}
+
+function printPrompt() {
+  // Re-print wallet info above prompt if wallet changed
+  const prompt =
+    `\n${c(BGREEN, "▶")} `;
+  process.stdout.write(prompt);
+}
+
+// ── Confirmation flow ─────────────────────────────────────────────────────────
+
+let _confirmResolver: ((approved: boolean) => void) | null = null;
+let _inConfirmMode = false;
+
+bus.on("confirm:request", (data: { prompt: string; txId: string }) => {
+  _inConfirmMode = true;
+  process.stdout.write("\n");
+  printSeparator();
+  process.stdout.write(c(YELLOW + BOLD, "⚠  CONFIRMATION REQUIRED\n\n"));
+  // Print each line of the confirmation prompt
+  for (const line of data.prompt.split("\n")) {
+    process.stdout.write(c(YELLOW, "  " + line) + "\n");
+  }
+  process.stdout.write("\n" + c(YELLOW + BOLD, "  Type YES to approve, anything else to cancel: "));
+});
+
+// Called by readline when user presses Enter during confirm mode
+function handleConfirmInput(line: string) {
+  _inConfirmMode = false;
+  const approved = line.trim().toUpperCase() === "YES";
+  printSeparator();
+  printSystemMessage(approved ? "✅ Confirmed — signing…" : "❌ Cancelled.");
+  if (_confirmResolver) {
+    _confirmResolver(approved);
+    _confirmResolver = null;
+  }
+}
+
+// Patch bus.awaitConfirmation to wire into our readline flow
+// (overrides the Promise-based version in utils.ts for this runtime)
+import { awaitConfirmation as _origAwait } from "./utils.js";
+// Re-export a readline-compatible version
+export async function awaitConfirmationCLI(
+  prompt: string,
+  txId: string,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      _inConfirmMode = false;
+      _confirmResolver = null;
+      reject(new Error("Confirmation timed out"));
+    }, timeoutMs);
+
+    _confirmResolver = (approved) => {
+      clearTimeout(timer);
+      resolve(approved);
+    };
+
+    bus.requestConfirmation(prompt, txId);
+  });
+}
+
+// Monkey-patch the utils module's awaitConfirmation via the bus
+// The tools call bus.requestConfirmation + listen on confirm:response,
+// so we just need to make sure handleConfirmInput fires bus.confirmationResponse.
+// That's already wired: handleConfirmInput → bus.confirmationResponse (below).
+
+// ── Main readline loop ────────────────────────────────────────────────────────
+
+async function main() {
+  // Validate API key
+  if (!ENV.OPENAI_API_KEY && !ENV.ANTHROPIC_API_KEY) {
+    process.stderr.write(
+      c(RED, "\n⚠  No LLM API key found!\n") +
+      "   Set OPENAI_API_KEY in your .env file. See .env.example.\n\n",
+    );
+    process.exit(1);
+  }
+
+  // Subscribe to log events and print them in real-time
+  bus.on("log", (entry: LogEntry) => {
+    // Don't print debug logs unless DEBUG=1
+    if (entry.level === "debug" && !process.env["DEBUG"]) return;
+    printLog(entry);
+  });
+
+  // Build agent (lazy — first query initialises it)
+  let agentGraph: AgentGraph | null = null;
+  const conversationHistory: BaseMessage[] = [];
+
+  function getGraph(): AgentGraph {
+    if (!agentGraph) {
+      agentGraph = buildAgentGraph();
+    }
+    return agentGraph;
+  }
+
+  // Print welcome screen
+  printWelcome();
+
+  // Set up readline
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    prompt: "",
+  });
+
+  // Keep the process alive
+  rl.on("close", () => {
+    process.stdout.write(c(GRAY, "\nBye!\n"));
+    process.exit(0);
+  });
+
+  let isProcessing = false;
+
+  printPrompt();
+
+  rl.on("line", async (rawLine) => {
+    const line = rawLine.trim();
+
+    // ── Confirmation mode: route to confirm handler ─────────────────────────
+    if (_inConfirmMode) {
+      const approved = line.toUpperCase() === "YES";
+      bus.confirmationResponse("pending", approved);
+      handleConfirmInput(line);
+      if (!isProcessing) printPrompt();
+      return;
+    }
+
+    if (!line) {
+      printPrompt();
+      return;
+    }
+
+    // ── Local commands ──────────────────────────────────────────────────────
+    if (line === "exit" || line === "quit" || line === "/exit") {
+      process.stdout.write(c(GRAY, "Bye!\n"));
+      process.exit(0);
+    }
+
+    if (line === "clear" || line === "/clear") {
+      process.stdout.write("\x1b[2J\x1b[H"); // clear screen
+      printWelcome();
+      printPrompt();
+      return;
+    }
+
+    if (line === "header" || line === "/header") {
+      printHeader();
+      printPrompt();
+      return;
+    }
+
+    if (isProcessing) {
+      process.stdout.write(c(YELLOW, "  Agent is busy, please wait…\n"));
+      printPrompt();
+      return;
+    }
+
+    // ── Send to agent ───────────────────────────────────────────────────────
+    printUserMessage(line);
+    isProcessing = true;
+
+    try {
+      const graph = getGraph();
+      const { response, updatedHistory } = await runAgentTurn(
+        graph,
+        conversationHistory,
+        line,
+      );
+
+      // Update history in-place
+      conversationHistory.length = 0;
+      conversationHistory.push(...updatedHistory);
+
+      if (response) {
+        printAssistantMessage(response);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      bus.log("error", `Agent error: ${msg}`);
+      printAssistantMessage(`⚠️  Error: ${msg}`);
+    } finally {
+      isProcessing = false;
+      printPrompt();
+    }
+  });
+}
+
+main().catch((err) => {
+  process.stderr.write(chalk.red(`Fatal: ${err.message}\n`));
+  process.exit(1);
+});

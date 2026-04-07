@@ -7,10 +7,10 @@
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "dev": "NODE_OPTIONS='--loader ts-node/esm' node src/main.tsx",
-    "build": "tsc",
-    "start": "node dist/main.js",
-    "typecheck": "tsc --noEmit"
+    "dev": "bun src/main.tsx",
+    "build": "bun tsc",
+    "start": "bun dist/main.js",
+    "typecheck": "bun tsc --noEmit"
   },
   "dependencies": {
     "@across-protocol/app-sdk": "^0.5.0",
@@ -23,28 +23,16 @@
     "bip39": "^3.1.0",
     "chalk": "^5.3.0",
     "dotenv": "^16.4.5",
-    "eventemitter3": "^5.0.1",
-    "figlet": "^1.7.0",
-    "gradient-string": "^2.0.2",
     "hdkey": "^2.1.0",
-    "ink": "^6.7.0",
-    "ink-big-text": "^2.0.0",
-    "ink-spinner": "^5.0.0",
-    "ink-text-input": "^6.0.0",
-    "ora": "^8.0.1",
-    "react": "^18.3.1",
     "uuid": "^10.0.0",
     "viem": "^2.21.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/bip39": "^3.0.4",
-    "@types/figlet": "^1.5.8",
     "@types/hdkey": "^2.0.4",
     "@types/node": "^20.14.0",
-    "@types/react": "^18.3.3",
     "@types/uuid": "^10.0.0",
-    "ts-node": "^10.9.2",
     "typescript": "^5.5.2"
   }
 }
